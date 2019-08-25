@@ -7,11 +7,16 @@
 		_MainTex("Albedo", 2D) = "white" {}
 		_Cutoff("Cutout", Range(0,1)) = .5
 		_BumpMap("Normals", 2D) = "bump" {}
-		//_SpecularColor("Specular Color", Color) = (0.5, 0.5, 0.5, 1.0)
+		[Toggle(BLOOM)]_UseSpecColor ("Use Specular Color", Range(0, 1)) = 0
+		_SpecularColor("Specular Color", Color) = (0.5, 0.5, 0.5, 1.0)
 		[Gamma] _Metallic("Metallic", Range(0, 1)) = 0
-		_Smoothness("Smoothness", Range(0, 1)) = 0
+		_Smoothness("Reflectivity", Range(0, 1)) = 0
 		_AnisotropyA("Anisotropy α", Range(-1, 1)) = 0
 		_AnisotropyB("Anisotropy β", Range(-1, 1)) = 0
+		[Header(Advanced)]
+		[Toggle(BLOOM_LOW)]_UseTangentTexture ("Use Tangent Shift Texture", Range(0, 1)) = 0
+		_TangentShiftTex("Tangent Shift Texture", 2D) = "black" {}
+		[Header(System)]
 		[Enum(Off, 0, Front, 1, Back, 2)] _Culling ("Culling Mode", Int) = 2
 		//[ToggleOff(_SPECULARHIGHLIGHTS_OFF)]_SpecularHighlights ("Specular Highlights", Float) = 1.0
 		[ToggleOff(_GLOSSYREFLECTIONS_OFF)]_GlossyReflections ("Glossy Reflections", Float) = 1.0
@@ -33,14 +38,18 @@
 			#include "AutoLight.cginc"
 			#include "UnityPBSLighting.cginc"
 
+			#pragma shader_feature _ BLOOM
+			#pragma shader_feature _ BLOOM_LOW
+
 			uniform float4 _Color;
-			//uniform float4 _SpecularColor;
+			uniform float4 _SpecularColor;
 			uniform float _Metallic;
 			uniform float _Smoothness;
 			uniform float _AnisotropyA;
 			uniform float _AnisotropyB;
 			uniform sampler2D _MainTex;
 			uniform sampler2D _BumpMap;
+			uniform sampler2D _TangentShiftTex;
 			uniform float4 _MainTex_ST;
 			uniform float _Cutoff;
 
@@ -359,9 +368,15 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				//// DESTROY energy conservation
 				//albedo = specularTint = texCol;
 
+				#if !defined(BLOOM)
 				float3 albedo = EnergyConservationBetweenDiffuseAndSpecular(
 					texCol, texCol*_Metallic, oneMinusReflectivity);
 				specularTint = texCol;
+				#else
+				float3 albedo = EnergyConservationBetweenDiffuseAndSpecular(
+					texCol, _SpecularColor*_Metallic, oneMinusReflectivity);
+				specularTint = _SpecularColor;
+				#endif
 
 				float3 viewDir = normalize(_WorldSpaceCameraPos - i.wPos);
 				UnityLight light;
@@ -395,7 +410,11 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				iii.tangent = i.tangent;
 				iii.bitangent = i.bitangent;
 
+				#if !defined(BLOOM_LOW)
 				float tangentShift = dot(texCol - tex2Dlod(_MainTex, float4(i.uv, 0, 7)) , 1.0);
+				#else
+				float tangentShift = tex2D(_TangentShiftTex, i.uv);
+				#endif
 				float3 col = BRDF_Hair_PBS(
 					albedo, specularTint,
 					oneMinusReflectivity, smoothness, tangentShift,
