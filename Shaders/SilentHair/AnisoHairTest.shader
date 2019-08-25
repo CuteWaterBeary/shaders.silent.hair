@@ -10,8 +10,8 @@
 		//_SpecularColor("Specular Color", Color) = (0.5, 0.5, 0.5, 1.0)
 		[Gamma] _Metallic("Metallic", Range(0, 1)) = 0
 		_Smoothness("Smoothness", Range(0, 1)) = 0
-		[Gamma]_AnisotropyA("Anisotropy α", Range(-1, 1)) = 0
-		[Gamma]_AnisotropyB("Anisotropy β", Range(-1, 1)) = 0
+		_AnisotropyA("Anisotropy α", Range(-1, 1)) = 0
+		_AnisotropyB("Anisotropy β", Range(-1, 1)) = 0
 		[Enum(Off, 0, Front, 1, Back, 2)] _Culling ("Culling Mode", Int) = 2
 		//[ToggleOff(_SPECULARHIGHLIGHTS_OFF)]_SpecularHighlights ("Specular Highlights", Float) = 1.0
 		[ToggleOff(_GLOSSYREFLECTIONS_OFF)]_GlossyReflections ("Glossy Reflections", Float) = 1.0
@@ -44,6 +44,16 @@
 			uniform float4 _MainTex_ST;
 			uniform float _Cutoff;
 
+#if defined(SHADER_STAGE_VERTEX) || defined(SHADER_STAGE_FRAGMENT) || defined(SHADER_STAGE_DOMAIN) || defined(SHADER_STAGE_HULL) || defined(SHADER_STAGE_GEOMETRY)
+#define TEX2DHALF Texture2D<half4>
+#define TEXLOAD(tex, uvcoord) tex.Load(uvcoord)
+#else
+#define precise
+#define centroid
+#define TEX2DHALF float4
+#define TEXLOAD(tex, uvcoord) half4(1,0,1,1)
+#endif
+
 			struct v2f
 			{
 				#ifndef UNITY_PASS_SHADOWCASTER
@@ -55,19 +65,19 @@
 				V2F_SHADOW_CASTER;
 				#endif
 				float2 uv : TEXCOORD1;
-				float3 tangent : TEXCOORD4;
-				float3 bitangent : TEXCOORD5;
+				centroid float3 tangent : TEXCOORD4_centroid;
+				centroid float3 bitangent : TEXCOORD5_centroid;
 			};
 
 			struct appdata_full_c {
 			    float4 vertex : POSITION;
-			    float4 tangent : TANGENT_centroid;
+			    centroid float4 tangent : TANGENT_centroid;
 			    float3 normal : NORMAL;
 			    float4 texcoord : TEXCOORD0;
 			    float4 texcoord1 : TEXCOORD1;
 			    float4 texcoord2 : TEXCOORD2;
 			    float4 texcoord3 : TEXCOORD3;
-			    fixed4 color : COLOR_centroid;
+			    centroid fixed4 color : COLOR_centroid;
 			    UNITY_VERTEX_INPUT_INSTANCE_ID
 			};
 
@@ -131,10 +141,10 @@
 			    float ToH = dot(t, h);
 			    float BoH = dot(b, h);
 			    float a2 = at * ab;
-			    float3 v = float3(ab * ToH, at * BoH, a2 * NoH);
-			    float v2 = dot(v, v);
-			    float w2 = a2 / v2;
-			    return a2 * w2 * w2 * UNITY_INV_PI;
+			    float3 d = float3(ab * ToH, at * BoH, a2 * NoH);
+			    float d2 = dot(d, d);
+			    float b2 = a2 / (d2);
+			    return UNITY_INV_PI * a2 * b2 * b2;
 			}
 
 			float V_SmithGGXCorrelated_Anisotropic(float at, float ab, float ToV, float BoV,
@@ -142,17 +152,17 @@
 			    // Heitz 2014, "Understanding the Masking-Shadowing Function in Microfacet-Based BRDFs"
 			    float lambdaV = NoL * length(float3(at * ToV, ab * BoV, NoV));
 			    float lambdaL = NoV * length(float3(at * ToL, ab * BoL, NoL));
-			    float v = 0.5 / (lambdaV + lambdaL + 1e-7f);
-			    return v;
+			    float v = 0.5f / (lambdaV + lambdaL + 1e-7f);
+			    return saturate(v);
 			}
 
-			// From "From mobile to high-end PC: Achieving high quality anime style rendering on Unity"
 			float3 ShiftTangent (float3 T, float3 N, float shift) 
 			{
 				float3 shiftedT = T + shift * N;
 				return normalize(shiftedT);
 			}
 
+			// From "From mobile to high-end PC: Achieving high quality anime style rendering on Unity"
 			float StrandSpecular(float3 T, float3 V, float3 L, float3 H, float exponent, float strength)
 			{
 				//float3 H = normalize(L+V);
@@ -168,6 +178,66 @@ struct Interpolators {
 	float3 bitangent;
 };
 
+//-----------------------------------------------------------------------------
+// Helper functions for roughness
+//-----------------------------------------------------------------------------
+
+float RoughnessToPerceptualRoughness(float roughness)
+{
+    return sqrt(roughness);
+}
+
+float RoughnessToPerceptualSmoothness(float roughness)
+{
+    return 1.0 - sqrt(roughness);
+}
+
+float PerceptualSmoothnessToRoughness(float perceptualSmoothness)
+{
+    return (1.0 - perceptualSmoothness) * (1.0 - perceptualSmoothness);
+}
+
+float PerceptualSmoothnessToPerceptualRoughness(float perceptualSmoothness)
+{
+    return (1.0 - perceptualSmoothness);
+}
+
+float PerceptualRoughnessToPerceptualSmoothness(float perceptualRoughness)
+{
+    return (1.0 - perceptualRoughness);
+}
+
+// Return modified perceptualSmoothness based on provided variance (get from GeometricNormalVariance + TextureNormalVariance)
+float NormalFiltering(float perceptualSmoothness, float variance, float threshold)
+{
+    float roughness = PerceptualSmoothnessToRoughness(perceptualSmoothness);
+    // Ref: Geometry into Shading - http://graphics.pixar.com/library/BumpRoughness/paper.pdf - equation (3)
+    float squaredRoughness = saturate(roughness * roughness + min(2.0 * variance, threshold * threshold)); // threshold can be really low, square the value for easier control
+
+    return RoughnessToPerceptualSmoothness(sqrt(squaredRoughness));
+}
+
+// Reference: Error Reduction and Simplification for Shading Anti-Aliasing
+// Specular antialiasing for geometry-induced normal (and NDF) variations: Tokuyoshi / Kaplanyan et al.'s method.
+// This is the deferred approximation, which works reasonably well so we keep it for forward too for now.
+// screenSpaceVariance should be at most 0.5^2 = 0.25, as that corresponds to considering
+// a gaussian pixel reconstruction kernel with a standard deviation of 0.5 of a pixel, thus 2 sigma covering the whole pixel.
+float GeometricNormalVariance(float3 geometricNormalWS, float screenSpaceVariance)
+{
+    float3 deltaU = ddx(geometricNormalWS);
+    float3 deltaV = ddy(geometricNormalWS);
+
+    return screenSpaceVariance * (dot(deltaU, deltaU) + dot(deltaV, deltaV));
+}
+
+// Return modified perceptualSmoothness
+float GeometricNormalFiltering(float perceptualSmoothness, float3 geometricNormalWS, float screenSpaceVariance, float threshold)
+{
+    float variance = GeometricNormalVariance(geometricNormalWS, screenSpaceVariance);
+    return NormalFiltering(perceptualSmoothness, variance, threshold);
+}
+
+
 // Based on Unity's Standard BRDF 1
 half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity, half smoothness, half tangentShift,
     Interpolators i, float3 viewDir,
@@ -178,7 +248,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 
     half nv = abs(dot(i.normal, viewDir));    // This abs allow to limit artifact
 
-    float nl = saturate(dot(i.normal, light.dir));
+    float nl = saturate(lerp(.25, 1.0, dot(i.normal, light.dir)));
     float nh = saturate(dot(i.normal, halfDir));
 
     half lv = saturate(dot(light.dir, viewDir));
@@ -190,10 +260,12 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     // Specular term
     float roughness = PerceptualRoughnessToRoughness(perceptualRoughness);
 
-	float at = max(roughness * (1.0 + _AnisotropyA), 0.001);
-	float ab = max(roughness * (1.0 - _AnisotropyB), 0.001);
+    // The values at and ab are perceptualRoughness^2
+	float at = max(roughness * (1.0 + _AnisotropyA), 0.002);
+	float ab = max(roughness * (1.0 - _AnisotropyB), 0.002);
 
-    // GGX with roughtness to 0 would mean no specular at all, using max(roughness, 0.002) here to match HDrenderloop roughtness remapping.
+    // GGX with roughness at 0 would mean no specular at all, 
+    // max(roughness, 0.002) matches HDRP roughness remapping. 
     roughness = max(roughness, 0.002);
 	#if 1
 	float TdotL = dot(i.tangent, light.dir);
@@ -209,7 +281,8 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     //float D = GGXTerm (nh, roughness); // Original 
 	float3 shiftedTangent = ShiftTangent(i.tangent, i.normal, tangentShift);
 	float D = D_GGX_Anisotropic(nh, halfDir, shiftedTangent, i.bitangent, at, ab);
-
+	D = min(D, 100); // Clamp to avoid weird fireflies
+/*
 	float specK;
 	#ifdef UNITY_PASS_FORWARDBASE
 	// Guesstimate a light direction if none exists.
@@ -219,8 +292,9 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 	float diffK = kajiya_kay(80.0, shiftedTangent, light.dir, i.normal, specK);
 
 	D += max(specK,0.0001);
-	D = min(D, 2); // Hack to fix sparks. 
+	//D = min(D, 2); // Hack to fix sparks. 
 	diffuseTerm = max(diffK,0.0001); // Not allowed to be zero?
+*/
 
     float specularTerm = V*D * UNITY_PI; // Torrance-Sparrow model, Fresnel is applied later
 
@@ -229,7 +303,8 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 #   endif
 
     // specularTerm * nl can be NaN on Metal in some cases, use max() to make sure it's a sane value
-    specularTerm = max(0, specularTerm * nl);
+    // Setting this to zero doesn't work. ???
+    specularTerm = max(1e-4h, specularTerm * nl);
 #if defined(_SPECULARHIGHLIGHTS_OFF)
     specularTerm = 0.0;
 #endif
@@ -251,7 +326,9 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     half grazingTerm = saturate(smoothness + (1-oneMinusReflectivity));
     half3 color =   //diffColor * (gi.diffuse + light.color * diffuseTerm)
     // This is wrong, but it doesn't look too bad.
-    				diffuseTerm;
+    				diffColor * (gi.diffuse + light.color * diffuseTerm)
+                    + specularTerm * light.color * FresnelTerm (specColor, lh)
+                    + surfaceReduction * gi.specular * FresnelLerp (specColor, grazingTerm, nv);
     return half4(color, 1);
 }
 
@@ -289,7 +366,8 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				float3 viewDir = normalize(_WorldSpaceCameraPos - i.wPos);
 				UnityLight light;
 				light.color = attenuation * _LightColor0.rgb;
-				light.dir = normalize(UnityWorldSpaceLightDir(i.wPos));
+				light.dir = Unity_SafeNormalize(UnityWorldSpaceLightDir(i.wPos));
+
 				UnityIndirect indirectLight;
 				#ifdef UNITY_PASS_FORWARDADD
 				indirectLight.diffuse = indirectLight.specular = 0;
@@ -302,6 +380,14 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				indirectLight.specular = Unity_GlossyEnvironment(
 					UNITY_PASS_TEXCUBE(unity_SpecCube0), unity_SpecCube0_HDR, envData
 				);
+				#endif
+
+				#ifdef UNITY_PASS_FORWARDBASE
+				// Guesstimate a light direction if none exists.
+				if (!any(_WorldSpaceLightPos0.xyz)) {
+				light.color = indirectLight.diffuse;
+				light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
+				}
 				#endif
 
 				Interpolators iii = (Interpolators)0;
@@ -374,5 +460,4 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 			ENDCG
 		}
 	}
-	Fallback "Standard"
 }
