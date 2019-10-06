@@ -7,18 +7,21 @@
 		_MainTex("Albedo", 2D) = "white" {}
 		_Cutoff("Cutout", Range(0,1)) = .5
 		_BumpMap("Normals", 2D) = "bump" {}
+		[Header(Specular)]
+		[Toggle(FINALPASS)]_UseEnergyConserv ("Use Energy Conservation", Range(0, 1)) = 0
 		[Toggle(BLOOM)]_UseSpecColor ("Use Specular Color", Range(0, 1)) = 0
 		_SpecularColor("Specular Color", Color) = (0.5, 0.5, 0.5, 1.0)
 		[Gamma] _Metallic("Metallic", Range(0, 1)) = 0
 		_Smoothness("Reflectivity", Range(0, 1)) = 0
-		_AnisotropyA("Anisotropy α", Range(-1, 1)) = 0
-		_AnisotropyB("Anisotropy β", Range(-1, 1)) = 0
+		_AnisotropyA("Anisotropy", Range(-1, 1)) = 0
+		//_AnisotropyA("Anisotropy α", Range(-1, 1)) = 0
+		//_AnisotropyB("Anisotropy β", Range(-1, 1)) = 0
 		[Header(Advanced)]
 		[Toggle(BLOOM_LOW)]_UseTangentTexture ("Use Tangent Shift Texture", Range(0, 1)) = 0
 		_TangentShiftTex("Tangent Shift Texture", 2D) = "black" {}
 		[Header(System)]
 		[Enum(Off, 0, Front, 1, Back, 2)] _Culling ("Culling Mode", Int) = 2
-		//[ToggleOff(_SPECULARHIGHLIGHTS_OFF)]_SpecularHighlights ("Specular Highlights", Float) = 1.0
+		[ToggleOff(_SPECULARHIGHLIGHTS_OFF)]_SpecularHighlights ("Specular Highlights", Float) = 1.0
 		[ToggleOff(_GLOSSYREFLECTIONS_OFF)]_GlossyReflections ("Glossy Reflections", Float) = 1.0
 	}
 	SubShader
@@ -38,8 +41,11 @@
 			#include "AutoLight.cginc"
 			#include "UnityPBSLighting.cginc"
 
+			#pragma shader_feature _ _SPECULARHIGHLIGHTS_OFF
+			#pragma shader_feature _ _GLOSSYREFLECTIONS_OFF
 			#pragma shader_feature _ BLOOM
 			#pragma shader_feature _ BLOOM_LOW
+			#pragma shader_feature _ FINALPASS
 
 			uniform float4 _Color;
 			uniform float4 _SpecularColor;
@@ -51,6 +57,7 @@
 			uniform sampler2D _BumpMap;
 			uniform sampler2D _TangentShiftTex;
 			uniform float4 _MainTex_ST;
+			uniform float4 _TangentShiftTex_ST;
 			uniform float _Cutoff;
 
 #if defined(SHADER_STAGE_VERTEX) || defined(SHADER_STAGE_FRAGMENT) || defined(SHADER_STAGE_DOMAIN) || defined(SHADER_STAGE_HULL) || defined(SHADER_STAGE_GEOMETRY)
@@ -137,7 +144,7 @@
 			    float sinTL = sqrt(one_minus_cosTL_squared);
 			    float sinTE = sqrt(one_minus_cosTE_squared);
 
-			    specular = pow(max(cosTL*cosTE + sinTL*sinTE, 0), p);
+			    specular = pow(max(cosTL*cosTE + sinTL*sinTE, 0.001), p);
 
 			    return sinTL;
 			}
@@ -176,7 +183,7 @@
 			{
 				//float3 H = normalize(L+V);
 				float dotTH = dot(T, H);
-				float sinTH = sqrt(1.0-dotTH*dotTH);
+				float sinTH = sqrt(1.0-dotTH*dotTH)+0.001;
 				float dirAtten = smoothstep(-1.0, 0.0, dotTH);
 				return dirAtten * pow(sinTH, exponent) * strength;
 			}
@@ -257,6 +264,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 
     half nv = abs(dot(i.normal, viewDir));    // This abs allow to limit artifact
 
+    // Classic approximation for hair scattering light with biased N.L
     float nl = saturate(lerp(.25, 1.0, dot(i.normal, light.dir)));
     float nh = saturate(dot(i.normal, halfDir));
 
@@ -271,7 +279,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 
     // The values at and ab are perceptualRoughness^2
 	float at = max(roughness * (1.0 + _AnisotropyA), 0.002);
-	float ab = max(roughness * (1.0 - _AnisotropyB), 0.002);
+	float ab = max(roughness * (1.0 - _AnisotropyA), 0.002);
 
     // GGX with roughness at 0 would mean no specular at all, 
     // max(roughness, 0.002) matches HDRP roughness remapping. 
@@ -360,6 +368,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				float3 specularTint;
 				float oneMinusReflectivity;
 				float smoothness = _Smoothness;
+				smoothness = GeometricNormalFiltering(smoothness, normal, 0.5, 0.25);
 				
 				//float3 albedo = DiffuseAndSpecularFromMetallic(
 				//	texCol, _Metallic, specularTint, oneMinusReflectivity
@@ -371,11 +380,19 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				#if !defined(BLOOM)
 				float3 albedo = EnergyConservationBetweenDiffuseAndSpecular(
 					texCol, texCol*_Metallic, oneMinusReflectivity);
-				specularTint = texCol;
+					#if defined(FINALPASS)
+					specularTint = texCol*_Metallic;
+					#else
+					specularTint = texCol;
+					#endif
 				#else
 				float3 albedo = EnergyConservationBetweenDiffuseAndSpecular(
 					texCol, _SpecularColor*_Metallic, oneMinusReflectivity);
-				specularTint = _SpecularColor;
+					#if defined(FINALPASS)
+					specularTint = _SpecularColor*_Metallic;
+					#else
+					specularTint = _SpecularColor;
+					#endif
 				#endif
 
 				float3 viewDir = normalize(_WorldSpaceCameraPos - i.wPos);
@@ -383,24 +400,46 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				light.color = attenuation * _LightColor0.rgb;
 				light.dir = Unity_SafeNormalize(UnityWorldSpaceLightDir(i.wPos));
 
+				// Direction may be wrong here, but there doesn't seem to be a better alternative
+				float3 anisotropicT = normalize(UnityObjectToWorldDir(float3(1, 0, 0)));
+    			float3 anisotropicB = normalize(cross(i.normal, anisotropicT));
+
+				#if !defined(BLOOM_LOW)
+				float tangentShift = dot(texCol - tex2Dlod(_MainTex, float4(i.uv, 0, 7)) , 1.0);
+				#else
+				float tangentShift = tex2D(_TangentShiftTex, i.uv * _TangentShiftTex_ST.xy + _TangentShiftTex_ST.zw);
+				#endif
+
 				UnityIndirect indirectLight;
 				#ifdef UNITY_PASS_FORWARDADD
 				indirectLight.diffuse = indirectLight.specular = 0;
 				#else
 				indirectLight.diffuse = max(0, ShadeSH9(float4(normal, 1)));
-				float3 reflectionDir = reflect(-viewDir, normal);
+
+				float3  anisotropyDirection = _AnisotropyA >= 0.0 ? anisotropicB : anisotropicT;
+    			float3  anisotropicTangent  = cross(anisotropyDirection, viewDir);
+    			float3  anisotropicNormal   = cross(anisotropicTangent, anisotropyDirection);
+    			float bendFactor          = abs(_AnisotropyA) * saturate(5.0 * SmoothnessToPerceptualRoughness(smoothness));
+    			float3  bentNormal          = normalize(lerp(i.normal, anisotropicNormal, bendFactor));
+
+				float3 reflectionDir = reflect(-viewDir, bentNormal);
+
 				Unity_GlossyEnvironmentData envData;
 				envData.roughness = 1 - smoothness;
 				envData.reflUVW = reflectionDir;
-				indirectLight.specular = Unity_GlossyEnvironment(
-					UNITY_PASS_TEXCUBE(unity_SpecCube0), unity_SpecCube0_HDR, envData
-				);
+				    #ifdef _GLOSSYREFLECTIONS_OFF
+				        indirectLight.specular = unity_IndirectSpecColor.rgb;
+				    #else
+					indirectLight.specular = Unity_GlossyEnvironment(
+						UNITY_PASS_TEXCUBE(unity_SpecCube0), unity_SpecCube0_HDR, envData
+					);
+					#endif
 				#endif
 
 				#ifdef UNITY_PASS_FORWARDBASE
 				// Guesstimate a light direction if none exists.
 				if (!any(_WorldSpaceLightPos0.xyz)) {
-				light.color = indirectLight.diffuse;
+				light.color = unity_IndirectSpecColor.rgb;
 				light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
 				}
 				#endif
@@ -409,12 +448,6 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				iii.normal = normal;
 				iii.tangent = i.tangent;
 				iii.bitangent = i.bitangent;
-
-				#if !defined(BLOOM_LOW)
-				float tangentShift = dot(texCol - tex2Dlod(_MainTex, float4(i.uv, 0, 7)) , 1.0);
-				#else
-				float tangentShift = tex2D(_TangentShiftTex, i.uv);
-				#endif
 				float3 col = BRDF_Hair_PBS(
 					albedo, specularTint,
 					oneMinusReflectivity, smoothness, tangentShift,
@@ -479,4 +512,5 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 			ENDCG
 		}
 	}
+	Fallback "Standard"
 }
