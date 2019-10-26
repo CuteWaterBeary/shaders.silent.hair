@@ -251,7 +251,16 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     float perceptualRoughness = SmoothnessToPerceptualRoughness (smoothness);
     float3 halfDir = Unity_SafeNormalize (float3(light.dir) + viewDir);
 
-    half nv = abs(dot(i.normal, viewDir));    // This abs allow to limit artifact
+	// NdotV should not be negative for visible pixels, but it can happen due to perspective projection and normal mapping
+	// In this case normal should be modified to become valid (i.e facing camera) and not cause weird artifacts.
+
+    // The amount we shift the normal toward the view vector is defined by the dot product.
+    half shiftAmount = dot(i.normal, viewDir);
+    i.normal = shiftAmount < 0.0f ? i.normal + viewDir * (-shiftAmount + 1e-5f) : i.normal;
+    // A re-normalization should be applied here but as the shift is small we don't do it to save ALU.
+    //normal = normalize(normal);
+
+    half nv = (dot(i.normal, viewDir)); 
 
     // Classic approximation for hair scattering light with biased N.L
     float nl = saturate(lerp(.25, 1.0, dot(i.normal, light.dir)));
@@ -326,19 +335,21 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     half grazingTerm = saturate(smoothness + (1-oneMinusReflectivity));
     half3 color =   
     // This is wrong, but it doesn't look too bad.
-    				diffColor * (gi.diffuse + light.color * diffuseTerm)
+    // Remove diffuse light if it's guesstimated.
+    				diffColor * (gi.diffuse + (light.color * (!any(_WorldSpaceLightPos0.xyz))) * diffuseTerm)
                     + specularTerm * light.color * FresnelTerm (specColor, lh)
                     + surfaceReduction * gi.specular * FresnelLerp (specColor, grazingTerm, nv);
     return half4(color, 1);
 }
 
 		#ifndef UNITY_PASS_SHADOWCASTER
-		float4 frag(v2f i) : SV_TARGET
+		float4 frag(v2f i, uint facing : SV_IsFrontFace) : SV_TARGET
 		{
 			fixed3 normalTangent = UnpackNormal( tex2D (_BumpMap, i.uv));
 			float3 normal = normalize(i.tangent * normalTangent.x + 
 									  i.bitangent * normalTangent.y + 
 									  i.normal * normalTangent.z); 
+			//normal.z *= facing? 1 : -1; 
 			float4 texCol = tex2D(_MainTex, i.uv) * _Color;
 
 			float alpha = texCol.a;
@@ -424,15 +435,19 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 			#ifdef UNITY_PASS_FORWARDBASE
 			// Guesstimate a light direction/color if none exists for specular highlights
 			if (!any(_WorldSpaceLightPos0.xyz)) {
-			light.color = unity_IndirectSpecColor.rgb;
+			// unity_IndirectSpecColor is derived from the skybox, which doesn't always make sense.
+			light.color = indirectLight.diffuse;
 			light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
 			}
 			#endif
 
+			// Workaround an issue with corrected NdotV where backfaces are megaflares.
+			light.color *=  (facing? 1 : 0);
+
 			Interpolators iii = (Interpolators)0;
 			iii.normal = normal;
-			iii.tangent = i.tangent;
-			iii.bitangent = i.bitangent;
+			iii.tangent = normalize(i.tangent);
+			iii.bitangent = normalize(i.bitangent);
 			float3 col = BRDF_Hair_PBS(
 				albedo, specularTint,
 				oneMinusReflectivity, smoothness, tangentShift,
