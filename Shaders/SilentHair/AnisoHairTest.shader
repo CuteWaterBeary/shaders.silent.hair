@@ -5,8 +5,13 @@
 	{
 		[HDR] _Color("Tint", Color) = (1,1,1,1)
 		_MainTex("Albedo", 2D) = "white" {}
-		_Cutoff("Cutout", Range(0,1)) = .5
+		_Cutoff("Cutout", Range(0,1)) = 0.5
+		_ClampCutoff("Transparency Threshold", Range(1, 0)) = 0.5
+		[ToggleUI]_AlphaSharp("Sharp Transparency", Float) = 0.0
+
+		[Space]
 		_BumpMap("Normals", 2D) = "bump" {}
+		_BumpScale("Normal Map Scale", Float) = 1
 		[Header(Specular)]
 		[Toggle(FINALPASS)]_UseEnergyConserv ("Use Energy Conservation", Range(0, 1)) = 0
 		[Toggle(BLOOM)]_UseSpecColor ("Use Specular Color", Range(0, 1)) = 0
@@ -16,9 +21,15 @@
 		_AnisotropyA("Anisotropy", Range(-1, 1)) = 0
 		//_AnisotropyA("Anisotropy α", Range(-1, 1)) = 0
 		//_AnisotropyB("Anisotropy β", Range(-1, 1)) = 0
+		_TangentA("Tangent Shift A", Range(-1, 1)) = 0.5
+		_TangentB("Tangent Shift B", Range(-1, 1)) = 0
+		_GlossA("Gloss Power A", Range(0, 1)) = 0.6
+		_GlossB("Gloss Power B", Range(0, 1)) = 1
 		[Header(Advanced)]
 		[Toggle(BLOOM_LOW)]_UseTangentTexture ("Use Tangent Shift Texture", Range(0, 1)) = 0
 		_TangentShiftTex("Tangent Shift Texture", 2D) = "black" {}
+		_OcclusionMap("Occlusion Map", 2D) = "white" {}
+		_OcclusionScale("Occlusion Scale", Range(0,1)) = 1.0
 		[Header(System)]
 		[Enum(Off, 0, Front, 1, Back, 2)] _Culling ("Culling Mode", Int) = 2
 		[ToggleOff(_SPECULARHIGHLIGHTS_OFF)]_SpecularHighlights ("Specular Highlights", Float) = 1.0
@@ -31,6 +42,7 @@
 			"RenderType"="TransparentCutout"
 			"Queue"="AlphaTest+0"
 			"IgnoreProjector"="True"
+			"DisableBatching"="True"
 		}
 
 		Cull [_Culling]
@@ -53,12 +65,21 @@
 			uniform float _Smoothness;
 			uniform float _AnisotropyA;
 			uniform float _AnisotropyB;
+			uniform float _TangentA;
+			uniform float _TangentB;
+			uniform float _GlossA;
+			uniform float _GlossB;
 			uniform sampler2D _MainTex;
 			uniform sampler2D _BumpMap;
 			uniform sampler2D _TangentShiftTex;
+			uniform sampler2D _OcclusionMap;
 			uniform float4 _MainTex_ST;
 			uniform float4 _TangentShiftTex_ST;
 			uniform float _Cutoff;
+			uniform float _ClampCutoff;
+			uniform float _AlphaSharp;
+			uniform float _BumpScale;
+			uniform float _OcclusionScale;
 
 			// Workaround for ShaderLab issues with DX11 properties. Thanks, Lyuma!
 			#if defined(SHADER_STAGE_VERTEX) || defined(SHADER_STAGE_FRAGMENT) || defined(SHADER_STAGE_DOMAIN) || defined(SHADER_STAGE_HULL) || defined(SHADER_STAGE_GEOMETRY)
@@ -101,7 +122,7 @@
 
 			v2f vert(appdata_full_c v)
 			{
-				v2f o;
+				v2f o = (v2f) 0;
 				#ifdef UNITY_PASS_SHADOWCASTER
 				TRANSFER_SHADOW_CASTER_NOPOS(o, o.pos);
 				#else
@@ -126,6 +147,13 @@ float intensity(float2 pixel) {
     const float a1 = 0.75487766624669276;
     const float a2 = 0.569840290998;
     return frac(a1 * float(pixel.x) + a2 * float(pixel.y));
+}
+
+// Interleaved Gradient Noise from "NEXT GENERATION POST PROCESSING IN CALL OF DUTY: ADVANCED WARFARE" http://advances.realtimerendering.com/s2014/index.html 
+float GradientNoise(float2 pixel)
+{
+	const float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+	return frac(magic.z * frac(dot(pixel, magic.xy)));
 }
 
 float T(float z) {
@@ -159,15 +187,19 @@ struct Interpolators {
 // https://github.com/google/filament
 //-----------------------------------------------------------------------------
 
-float D_GGX_Anisotropic(float NoH, const float3 h,
-		const float3 t, const float3 b, float at, float ab) {
-    float ToH = dot(t, h);
-    float BoH = dot(b, h);
+float D_GGX_Anisotropic(float NoH, float ToH, float BoH,
+		float roughness, float gloss) {
+
+	float anisotropy = _AnisotropyA * gloss;
+    // The values at and ab are perceptualRoughness^2
+	float at = max(roughness * (1.0 + anisotropy), 0.002);
+	float ab = max(roughness * (1.0 - anisotropy), 0.002);
     float a2 = at * ab;
     float3 d = float3(ab * ToH, at * BoH, a2 * NoH);
+    d += !d * 1e-4f;
     float d2 = dot(d, d);
-    float b2 = a2 / (d2);
-    return UNITY_INV_PI * a2 * b2 * b2;
+    float b2 = a2 / d2;
+    return a2 * b2 * b2 * UNITY_INV_PI;
 }
 
 float V_SmithGGXCorrelated_Anisotropic(float at, float ab, float ToV, float BoV,
@@ -244,6 +276,28 @@ float GeometricNormalFiltering(float perceptualSmoothness, float3 geometricNorma
 // Based on Unity's Standard BRDF 1
 //-----------------------------------------------------------------------------
 
+float getAnisoD (float NoH, float3 halfDir, float3 tangent, float3 normal, float roughness, float tangentShift) 
+{
+	half3 b; float ToH; float BoH;
+
+    b = cross(normal + float3(0, 0, _TangentA), tangent);
+
+    ToH = dot(tangent, halfDir);
+    BoH = dot(b, halfDir);
+
+	//float3 shiftedTangent1 = ShiftTangent(tangent, normal, 0 + _TangentA);
+	float D1 = D_GGX_Anisotropic(NoH, ToH, BoH, roughness, _GlossA);
+
+    b = cross(normal + float3(0, 0, _TangentB), tangent);
+
+    ToH = dot(tangent, halfDir);
+    BoH = dot(b, halfDir);
+
+	//float3 shiftedTangent2 = ShiftTangent(tangent, normal, tangentShift + _TangentB);
+	float D2 = D_GGX_Anisotropic(NoH, ToH, BoH, roughness, saturate(_GlossB+tangentShift));
+	return min(D1 + D2, 100);
+}
+
 half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity, half smoothness, half tangentShift,
     Interpolators i, float3 viewDir,
     UnityLight light, UnityIndirect gi)
@@ -251,16 +305,19 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     float perceptualRoughness = SmoothnessToPerceptualRoughness (smoothness);
     float3 halfDir = Unity_SafeNormalize (float3(light.dir) + viewDir);
 
-	// NdotV should not be negative for visible pixels, but it can happen due to perspective projection and normal mapping
-	// In this case normal should be modified to become valid (i.e facing camera) and not cause weird artifacts.
+#define UNITY_HANDLE_CORRECTLY_NEGATIVE_NDOTV_local 0
 
+#if UNITY_HANDLE_CORRECTLY_NEGATIVE_NDOTV_local
     // The amount we shift the normal toward the view vector is defined by the dot product.
     half shiftAmount = dot(i.normal, viewDir);
     i.normal = shiftAmount < 0.0f ? i.normal + viewDir * (-shiftAmount + 1e-5f) : i.normal;
     // A re-normalization should be applied here but as the shift is small we don't do it to save ALU.
     //normal = normalize(normal);
 
-    half nv = (dot(i.normal, viewDir)); 
+    half nv = saturate(dot(i.normal, viewDir)); // TODO: this saturate should no be necessary here
+#else
+    half nv = abs(dot(i.normal, viewDir));    // This abs allow to limit artifact
+#endif
 
     // Classic approximation for hair scattering light with biased N.L
     float nl = saturate(lerp(.25, 1.0, dot(i.normal, light.dir)));
@@ -275,16 +332,13 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     // Specular term
     float roughness = PerceptualRoughnessToRoughness(perceptualRoughness);
 
-    // The values at and ab are perceptualRoughness^2
-	float at = max(roughness * (1.0 + _AnisotropyA), 0.002);
-	float ab = max(roughness * (1.0 - _AnisotropyA), 0.002);
-
     // GGX with roughness at 0 would mean no specular at all, 
     // max(roughness, 0.002) matches HDRP roughness remapping. 
     roughness = max(roughness, 0.002);
 
     // More accurate visibility term instead of non-anisotropic?
-	#if 1
+    // Probably not worth it.
+	#if 0
 	float TdotL = dot(i.tangent, light.dir);
 	float BdotL = dot(i.bitangent, light.dir);
 	float TdotV = dot(i.tangent, viewDir);
@@ -296,17 +350,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 	#endif
 
     //float D = GGXTerm (nh, roughness); // Original 
-	float3 shiftedTangent = ShiftTangent(i.tangent, i.normal, tangentShift);
-	float D = D_GGX_Anisotropic(nh, halfDir, shiftedTangent, i.bitangent, at, ab);
-	D = min(D, 100); // Clamp to avoid weird fireflies
-
-/*
-	#ifdef UNITY_PASS_FORWARDBASE
-	// Guesstimate a light direction if none exists.
-	light.color = any(_WorldSpaceLightPos0.xyz) ? light.color : gi.diffuse;
-	light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
-	#endif
-*/
+    float D = getAnisoD(nh, halfDir, i.tangent, i.normal, roughness, tangentShift);
 
     float specularTerm = V*D * UNITY_PI; // Torrance-Sparrow model, Fresnel is applied later
 
@@ -342,20 +386,57 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
     return half4(color, 1);
 }
 
+inline void applyAlphaClip(inout float alpha, float cutoff, float2 pos, bool sharpen)
+{
+    // Get the amount of MSAA samples present
+    #if (SHADER_TARGET > 40)
+    half samplecount = GetRenderTargetSampleCount();
+    #else
+    half samplecount = 1;
+    #endif
+
+    pos += (_SinTime.x%4) * 0.7;
+    // Switch between dithered alpha and sharp-edge alpha.
+        if (!sharpen) {
+            alpha = (1+cutoff) * alpha - cutoff;
+            alpha = saturate(alpha + alpha*_ClampCutoff);
+            float mask = (T(intensity(pos)));
+            const float width = 1 / (samplecount*2-1);
+            alpha = alpha - (mask * sqrt(1-(alpha)) * width);
+        }
+        else {
+            alpha = ((alpha - cutoff) / max(fwidth(alpha), 0.0001) + 0.5);
+        }
+    // If 0, remove now.
+    clip (alpha - 1.0/255.0);
+}
+
 		#ifndef UNITY_PASS_SHADOWCASTER
 		float4 frag(v2f i, uint facing : SV_IsFrontFace) : SV_TARGET
 		{
-			fixed3 normalTangent = UnpackNormal( tex2D (_BumpMap, i.uv));
-			float3 normal = normalize(i.tangent * normalTangent.x + 
-									  i.bitangent * normalTangent.y + 
-									  i.normal * normalTangent.z); 
+    		half3 normalTangent = UnpackScaleNormal(tex2D (_BumpMap, i.uv), _BumpScale);
+		    // Thanks, Xiexe!
+		    half3 tspace0 = half3(i.tangent.x, i.bitangent.x, i.normal.x);
+		    half3 tspace1 = half3(i.tangent.y, i.bitangent.y, i.normal.y);
+		    half3 tspace2 = half3(i.tangent.z, i.bitangent.z, i.normal.z);
+
+		    half3 calcedNormal;
+		    calcedNormal.x = dot(tspace0, normalTangent);
+		    calcedNormal.y = dot(tspace1, normalTangent);
+		    calcedNormal.z = dot(tspace2, normalTangent);
+		    
+		    float3 normal = normalize(calcedNormal);
+		    half3 bumpedTangent = (cross(i.bitangent, calcedNormal));
+		    half3 bumpedBitangent = (cross(calcedNormal, bumpedTangent));
+
+		    // Flip normals not facing the camera already, but this is bad for hair...
 			//normal.z *= facing? 1 : -1; 
 			float4 texCol = tex2D(_MainTex, i.uv) * _Color;
+			float occlusion = LerpOneTo(tex2D(_OcclusionMap, i.uv).g, _OcclusionScale);
 
 			float alpha = texCol.a;
-			float mask = (T(intensity(i.pos.xy + _SinTime.x%4)));
-			alpha = saturate(alpha + alpha * mask); 
-			clip(alpha - 1.0/255.0); // Attempt to fix no-HDR bug
+
+			applyAlphaClip(alpha, _Cutoff, i.pos.xy, _AlphaSharp);
 
 			float2 uv = i.uv;
 
@@ -365,16 +446,19 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 			float oneMinusReflectivity;
 			float smoothness = _Smoothness;
 			smoothness = GeometricNormalFiltering(smoothness, normal, 0.5, 0.25);
-			
-			//float3 albedo = DiffuseAndSpecularFromMetallic(
-			//	texCol, _Metallic, specularTint, oneMinusReflectivity
-			//);
-			//
-			//// DESTROY energy conservation
-			//albedo = specularTint = texCol;
 
 			#if !defined(BLOOM) // Metalness mode
-			float3 albedo = EnergyConservationBetweenDiffuseAndSpecular(
+				oneMinusReflectivity = OneMinusReflectivityFromMetallic(_Metallic);
+				float3 albedo = DiffuseAndSpecularFromMetallic(
+					texCol, _Metallic, specularTint, oneMinusReflectivity
+				);
+			#else  // Specular colour mode
+				oneMinusReflectivity = 1 - SpecularStrength(_SpecularColor); 
+				float3 albedo = texCol;
+			#endif
+
+			#if !defined(BLOOM) // Metalness mode
+				albedo = EnergyConservationBetweenDiffuseAndSpecular(
 				texCol, texCol*_Metallic, oneMinusReflectivity);
 				#if defined(FINALPASS) // "Energy convervation"
 				specularTint = texCol*_Metallic;
@@ -382,7 +466,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				specularTint = texCol;
 				#endif
 			#else  // Specular colour mode
-			float3 albedo = EnergyConservationBetweenDiffuseAndSpecular(
+				albedo = EnergyConservationBetweenDiffuseAndSpecular(
 				texCol, _SpecularColor*_Metallic, oneMinusReflectivity);
 				#if defined(FINALPASS) // "Energy convervation"
 				specularTint = _SpecularColor*_Metallic;
@@ -401,7 +485,7 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 			float3 anisotropicB = normalize(cross(i.normal, anisotropicT));
 
 			#if !defined(BLOOM_LOW) // Use shift texture
-			float tangentShift = dot(texCol - tex2Dlod(_MainTex, float4(i.uv, 0, 7)) , 1.0);
+			float tangentShift = dot(0.2 + texCol.rgb - tex2Dlod(_MainTex, float4(i.uv, 0, 7)).rgb , 0.5);
 			#else
 			float tangentShift = tex2D(_TangentShiftTex, i.uv * _TangentShiftTex_ST.xy + _TangentShiftTex_ST.zw);
 			#endif
@@ -432,12 +516,15 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 				#endif
 			#endif
 
+			indirectLight.specular *= occlusion;
+
 			#ifdef UNITY_PASS_FORWARDBASE
 			// Guesstimate a light direction/color if none exists for specular highlights
 			if (!any(_WorldSpaceLightPos0.xyz)) {
-			// unity_IndirectSpecColor is derived from the skybox, which doesn't always make sense.
-			light.color = indirectLight.diffuse;
-			light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
+				// unity_IndirectSpecColor is derived from the skybox, which doesn't always make sense.
+				//light.color = indirectLight.diffuse;
+				light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
+    			light.color = ShadeSH9(half4(light.dir, 1.0));
 			}
 			#endif
 
@@ -465,13 +552,11 @@ half4 BRDF_Hair_PBS (half3 diffColor, half3 specColor, half oneMinusReflectivity
 		float4 frag(v2f i) : SV_Target
 		{
 			float alpha = _Color.a;
-			if (_Cutoff > 0)
+			if (_Color.a > 0)
 				alpha *= tex2D(_MainTex, i.uv).a;
 
-			float mask = (T(intensity(i.pos.xy + _SinTime.x%4)));
-			//alpha *= alpha;
-			alpha = saturate(alpha + alpha * mask); 
-			clip(alpha - _Cutoff);
+			applyAlphaClip(alpha, _Cutoff, i.pos.xy, _AlphaSharp);
+
 			SHADOW_CASTER_FRAGMENT(i)
 		}
 		#endif
