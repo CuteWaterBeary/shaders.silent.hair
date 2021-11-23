@@ -12,6 +12,8 @@
 		[Space]
 		_BumpMap("Normals", 2D) = "bump" {}
 		_BumpScale("Normal Map Scale", Float) = 1
+		_Emission("Emission", Range(0, 20)) = 0
+		
 		[Header(Specular)]
 		[Toggle(FINALPASS)]_UseEnergyConserv ("Use Energy Conservation", Range(0, 1)) = 0
 		[Toggle(BLOOM)]_UseSpecColor ("Use Specular Color", Range(0, 1)) = 0
@@ -61,6 +63,7 @@
 
 			uniform float4 _Color;
 			uniform float4 _SpecularColor;
+			uniform float _Emission;
 			uniform float _Metallic;
 			uniform float _Smoothness;
 			uniform float _AnisotropyA;
@@ -541,6 +544,9 @@ inline void applyAlphaClip(inout float alpha, float cutoff, float2 pos, bool sha
 				iii, viewDir,
 				light, indirectLight
 			);
+			
+			//Apply emission
+			col.rgb += texCol * _Emission;
 
 			#ifdef UNITY_PASS_FORWARDADD
 			return float4(col, 0);
