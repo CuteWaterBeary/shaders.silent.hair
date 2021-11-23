@@ -15,7 +15,7 @@
 		[Header(Specular)]
 		[Toggle(FINALPASS)]_UseEnergyConserv ("Use Energy Conservation", Range(0, 1)) = 0
 		[Toggle(BLOOM)]_UseSpecColor ("Use Specular Color", Range(0, 1)) = 0
-		[Toggle(FAKEDIRECTIONAL)]_FakeDirectional ("Fake directional light if missing", Range(0, 1)) = 0
+		[ToggleUI]_FakeDirectional ("Fake directional light if missing", Range(0, 1)) = 0
 		_SpecularColor("Specular Color", Color) = (0.5, 0.5, 0.5, 1.0)
 		[Gamma] _Metallic("Metallic", Range(0, 1)) = 0
 		_Smoothness("Reflectivity", Range(0, 1)) = 0
@@ -59,7 +59,6 @@
 			#pragma shader_feature _ BLOOM
 			#pragma shader_feature _ BLOOM_LOW
 			#pragma shader_feature _ FINALPASS
-			#pragma shader_feature_local FAKEDIRECTIONAL
 			
 			uniform float4 _Color;
 			uniform float4 _SpecularColor;
@@ -82,6 +81,7 @@
 			uniform float _AlphaSharp;
 			uniform float _BumpScale;
 			uniform float _OcclusionScale;
+			uniform float _FakeDirectional;
 
 			// Workaround for ShaderLab issues with DX11 properties. Thanks, Lyuma!
 			#if defined(SHADER_STAGE_VERTEX) || defined(SHADER_STAGE_FRAGMENT) || defined(SHADER_STAGE_DOMAIN) || defined(SHADER_STAGE_HULL) || defined(SHADER_STAGE_GEOMETRY)
@@ -521,15 +521,13 @@ inline void applyAlphaClip(inout float alpha, float cutoff, float2 pos, bool sha
 			indirectLight.specular *= occlusion;
 
 			#ifdef UNITY_PASS_FORWARDBASE
-			#ifdef FAKEDIRECTIONAL
 			// Guesstimate a light direction/color if none exists for specular highlights
-			if (!any(_WorldSpaceLightPos0.xyz)) {
+			if (_FakeDirectional && !any(_WorldSpaceLightPos0.xyz)) {
 				// unity_IndirectSpecColor is derived from the skybox, which doesn't always make sense.
 				//light.color = indirectLight.diffuse;
 				light.dir = Unity_SafeNormalize(light.dir + unity_SHAr.xyz + unity_SHAg.xyz + unity_SHAb.xyz);
     			light.color = ShadeSH9(half4(light.dir, 1.0));
 			}
-			#endif
 			#endif
 
 			// Workaround an issue with corrected NdotV where backfaces are megaflares.
